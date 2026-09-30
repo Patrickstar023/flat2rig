@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# 本机临时目录（这台机器的系统 TEMP 不可写，工程内自建）
+.tmp/
+pip-*.log
+
+# 生成物
+out/
+examples/out/
+frames/
+frames2/
+frames3/
+pet-art/
+*.png
+!examples/**/*.png
+
+# 演示用立绘：受版权保护，不随仓库分发（见 examples/README.md）
+examples/art/

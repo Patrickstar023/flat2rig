@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flat2rig"
+version = "0.1.0"
+description = "Turn a single flat character illustration into rigged, part-animated sprite frames — no GPU, no model weights, no manual layering."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "flat2rig contributors" }]
+keywords = ["sprite", "rigging", "animation", "live2d", "game-dev", "2d", "puppet"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Topic :: Games/Entertainment",
+  "Topic :: Multimedia :: Graphics",
+]
+dependencies = [
+  "numpy>=1.24",
+  "Pillow>=10.0",
+  "scipy>=1.10",
+]
+
+[project.optional-dependencies]
+psd = ["psd-tools>=1.9"]
+dev = ["pytest>=7.4"]
+
+[project.urls]
+Homepage = "https://github.com/<you>/flat2rig"
+Issues = "https://github.com/<you>/flat2rig/issues"
+
+[project.scripts]
+flat2rig = "flat2rig.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["slow: takes more than a couple of seconds"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
