@@ -38,6 +38,9 @@ VISIBLE_EPS = 0.02
 DIFFUSION_ITERS = 200
 #: Max per-channel difference for a mirror sample to be trusted (0-255).
 MIRROR_TOLERANCE = 26.0
+#: 图层像素 alpha 不超过此值才算"空的"、允许被补全写入；
+#: 高于它的（含羽化带）一律不动 —— 否则补全会覆盖部位自己的真实像素（实测过的事故）。
+FILL_ALPHA_GATE = 2
 #: How many pixels of background colour get bled outwards (anti-halo margin).
 BLEED_ITERS = 4
 
@@ -383,14 +386,20 @@ def _refill_layer(base: np.ndarray, src: np.ndarray, src_alpha: np.ndarray,
             reached = reached | fresh
         fall[occ_bin[sl]] = 1.0
 
-    # 6. composite the reconstruction into the layer.
+    # 6. 把补出来的内容写回图层。
+    #
+    # 只写"洞"里的像素，而且**只写图层上原本没有内容的地方**——这是本条流水线上最容易
+    # 踩的坑：早先的写入范围是 `dom & (fall > 0)`，而 dom 还包含洞外那一圈部位自己的
+    # 真实像素（ring），补全于是把这些真实像素的颜色也覆盖掉了：实测 body 684px +
+    # ear 1087px 的"原本完全不透明"像素被改写，表现就是形象发脏、脸被涂抹。
+    # 这里再加一道闸：图层上已有 alpha 的像素（含羽化带）绝不触碰，
+    # 洞与真实像素之间的过渡交给部位自身 alpha 的羽化。
     out_rgb = base[..., :3][sl]
     out_a = base[..., 3][sl]
-    touch = dom & (fall > 0.0)
-    if touch.any():
-        w = fall[touch][:, None]
-        out_rgb[touch] = val[touch] * w + out_rgb[touch] * (1.0 - w)
-        out_a[touch] = np.maximum(out_a[touch], src_alpha[sl][touch] * occ[sl][touch] * fall[touch])
+    hole = occ_bin[sl] & (out_a <= FILL_ALPHA_GATE)
+    if hole.any():
+        out_rgb[hole] = val[hole]
+        out_a[hole] = np.maximum(out_a[hole], src_alpha[sl][hole] * occ[sl][hole])
     return base
 
 

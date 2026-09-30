@@ -275,13 +275,10 @@ def build_frames(rgba: Image.Image, rig: "Rig", masks: dict[str, Image.Image],
                 frame.alpha_composite(overlay)
             sequence_frames.append((frame, delay))
 
-        if state == "idle" and rig.eyes and sequence_frames:
-            # 眨眼是"循环中的一次变体"，不是额外的一帧：把闭眼叠加到第一帧上，
-            # 这样帧数始终等于最长动作序列（README 的契约），每循环眨一次眼。
-            first_frame, first_delay = sequence_frames[0]
-            blink = first_frame.copy()
-            blink.alpha_composite(_fit(overlay_eyes(rig.eyes), size))
-            sequence_frames[0] = (blink, first_delay)
+        # 说明：这里**不再**往 idle 首帧叠加闭眼弧。
+        # 曾经的做法是第一帧叠加 overlay_eyes，但原画本身已经画好了眼睛，
+        # 再叠一层深色弧线会表现为"眼睛变了、整体发脏"（用户实际反馈）。
+        # 需要眨眼时请在标注里显式提供 eyes，并自行确认叠加效果；默认不动原画。
 
         frames[state] = sequence_frames
     return frames
@@ -294,11 +291,9 @@ def _state_overlay(rig: "Rig", state: str, step: int, size: tuple[int, int]) -> 
     """Decoration composited on top of every frame of ``state`` (or ``None``)."""
     symbol_size = max(size)
     if state == "sleep":
-        overlay = Image.new("RGBA", size, (0, 0, 0, 0))
-        if rig.eyes:
-            overlay.alpha_composite(_fit(overlay_eyes(rig.eyes, droop=True), size))
-        overlay.alpha_composite(_fit(overlay_symbol("zzz", step, symbol_size), size))
-        return overlay
+        # 只放 Z，不画闭眼：原画本身只有"睁眼"一种眼型，程序画的闭眼弧叠上去
+        # 就是一团深色（用户反馈"眼睛变了、发脏"）。宁可让眼睛保持原样。
+        return _fit(overlay_symbol("zzz", step, symbol_size), size)
     if state == "error":
         return _fit(overlay_symbol("sweat", step, symbol_size), size)
     if state == "celebrate":
