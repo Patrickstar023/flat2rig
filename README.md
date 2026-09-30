@@ -112,6 +112,21 @@ flat2rig build ./see_through_layers/ --layers -c hero.rig.json -o out/
 `--layers` treats the input directory as a **back-to-front ordered list of RGBA layers**
 (any of `.png` / `.psd`); no decomposition is performed, only rigging + animation.
 
+### 4. Feeding a desktop-pet shell (optional)
+
+```bash
+flat2rig petset --art examples/art -o petset-out          # 全部预设角色
+flat2rig petset --preset daermaodou --art examples/art -o petset-out \
+                --plugin /path/to/pet-plugin               # 顺带复制进插件目录
+```
+
+`petset` 把帧按桌面宠物壳常用的约定命名（`<角色>_<状态>_<两位序号>.png`）落盘，
+并写一份 `manifest.json`（角色 → 状态 → 帧文件 + 每帧毫秒数）。插件侧读这份清单即可，
+**无需硬编码帧数**——加状态、改帧数都不用动插件代码。
+
+一个真实用例：`whale-pet-redesign/build-frames.mjs` 会扫描该目录并把帧内联进
+`lib/client.js`（`node build-frames.mjs --from petset-out --apply`）。
+
 ---
 
 ## Install

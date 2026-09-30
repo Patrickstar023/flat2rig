@@ -201,6 +201,45 @@ def cmd_autotag(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_petset(args: argparse.Namespace) -> int:
+    """导出成桌面宠物插件可直接使用的逐帧素材。"""
+    from .petset import export_petset, copy_into_plugin, find_preset, PRESET_DIRS
+
+    if args.preset == "all":
+        names = ["daermaodou", "juhuali", "xueyuanguagua"]
+    else:
+        names = [s.strip() for s in args.preset.split(",") if s.strip()]
+
+    art_dir = Path(args.art)
+    entries = []
+    for name in names:
+        image = art_dir / f"{name}-idle.png"
+        if not image.is_file():
+            # 也允许直接给 <角色>.png
+            alt = art_dir / f"{name}.png"
+            image = alt if alt.is_file() else image
+        if not image.is_file():
+            return _fail(f"找不到 {name} 的立绘：{image}（用 --art 指定目录，文件名 <角色>-idle.png）")
+        config = Path(args.config) if args.config else find_preset(name)
+        if config is None:
+            return _fail(f"找不到 {name} 的标注；用 --config 指定，或先把预设放到 {PRESET_DIRS[0]}")
+        entries.append({"name": name, "image": str(image), "config": str(config)})
+
+    states = [s.strip() for s in args.states.split(",") if s.strip()] or None
+    export = export_petset(entries, args.output, states=states)
+    print(f"导出 {len(export.characters)} 个角色、共 {export.frame_count} 帧 → {export.out_dir}")
+    for who, states_map in export.characters.items():
+        detail = "、".join(f"{st}×{len(info['files'])}" for st, info in states_map.items())
+        print(f"  {who:16s} {detail}")
+    print(f"  manifest → {Path(export.out_dir) / 'manifest.json'}")
+
+    if args.plugin:
+        dst = copy_into_plugin(export.out_dir, args.plugin)
+        print(f"已复制到插件：{dst}")
+        print("下一步：在该插件仓库里执行  node build-frames.mjs --apply  让插件内联这些帧。")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="flat2rig",
                                 description="把一张平面立绘切成可独立运动的部位，并生成动画帧。")
@@ -220,6 +259,17 @@ def build_parser() -> argparse.ArgumentParser:
     at.add_argument("-o", "--output", default="rig.json", help="输出标注 JSON")
     at.add_argument("--parts", default="ear,head,body", help="三段部位名，逗号分隔")
     at.set_defaults(func=cmd_autotag)
+
+    ps = sub.add_parser("petset", help="导出成桌面宠物插件可用的逐帧素材（含 manifest）")
+    ps.add_argument("--preset", default="all",
+                    help="角色名，逗号分隔；或 all（默认三个示例角色）")
+    ps.add_argument("--art", default="examples/art",
+                    help="立绘目录，文件名需为 <角色>-idle.png（默认 examples/art）")
+    ps.add_argument("--config", default="", help="只处理单个角色时直接指定标注 JSON")
+    ps.add_argument("-o", "--output", default="petset-out", help="输出目录")
+    ps.add_argument("--states", default="", help="只导出这些状态，逗号分隔")
+    ps.add_argument("--plugin", default="", help="给定时，把结果复制到该插件的 petframes/ 下")
+    ps.set_defaults(func=cmd_petset)
 
     pv = sub.add_parser("preview", help="把帧目录生成自包含预览页")
     pv.add_argument("frames", help="帧目录")

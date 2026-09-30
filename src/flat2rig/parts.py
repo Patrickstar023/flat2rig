@@ -145,7 +145,7 @@ def inpaint_hidden(rgba: Image.Image, masks: dict[str, Image.Image], order: list
         # 被遮挡区域按定义位于本部位"可见像素之外"，因此不能要求它落在自身轮廓内
         # （否则补全会被全部否决）。合理判据：从可见像素出发，沿着被前景覆盖的区域
         # 做连通生长——只补"前景确实压在上面、且与本体相连"的地方。
-        grown = _grow_into_front(own_bin, front)
+        grown = _grow_into_front(own_bin, front, max_dist=max(8, int(radius) * 3))
         occ = np.clip(front * np.maximum(support, grown) * (1.0 - own), 0.0, 1.0)
         occ_bin = occ > VISIBLE_EPS
         if not occ_bin.any():
@@ -162,18 +162,24 @@ def inpaint_hidden(rgba: Image.Image, masks: dict[str, Image.Image], order: list
 # occlusion fill internals
 # --------------------------------------------------------------------------- #
 def _grow_into_front(own_bin: np.ndarray, front: np.ndarray,
-                     max_iter: int = 4096) -> np.ndarray:
-    """从本部位的可见像素出发，在"被前景覆盖"的区域里做四邻连通生长。
+                     max_dist: int = 24, max_iter: int = 4096) -> np.ndarray:
+    """从本部位的可见像素出发，在"被前景覆盖"的区域里生长，但**限制在接触带内**。
 
-    被遮挡的像素按定义不在 ``own_bin`` 内，所以"补全范围必须落在自身轮廓内"这类约束
-    会把补全全部否决。正确判据是沿 ``front`` 连通生长：既不越出前景覆盖范围，也不会
-    凭空长出与本体不相连的大块。
+    两个关键约束（都是被真实缺陷逼出来的）：
+
+    1. 不能要求补全区域"落在自身轮廓内"——被遮挡区域按定义就在轮廓之外；
+    2. 也不能把整块被遮挡区域都据为己有——那会把本部位的"空白填充版"整片盖到
+       前景之上（前景一旦不动，就会看到一块假的补丁）。
+
+    因此只补**离可见像素不超过 ``max_dist`` 像素、且被前景覆盖**的连通区域：
+    旋转只会在这个接触带里露出缝隙，补上这一条就够，其余保持透明，让下层的
+    真实像素透出来。
     """
     allowed = front > 0 if front.dtype != np.bool_ else front
     grown = np.zeros_like(own_bin, dtype=bool)
     frontier = own_bin & allowed
     grown |= frontier
-    for _ in range(max_iter):
+    for _ in range(max(0, max_dist)):
         nxt = np.zeros_like(frontier)
         nxt[1:, :] |= frontier[:-1, :]
         nxt[:-1, :] |= frontier[1:, :]

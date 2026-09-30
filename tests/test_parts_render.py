@@ -402,3 +402,66 @@ def test_autotag_gives_different_motions_to_different_levels(make_character, tmp
     ear, head, body = cfg["parts"]
     assert ear["motions"]["idle"] != head["motions"]["idle"], "上段与中段应当有不同动作曲线"
     assert head["motions"]["idle"] == body["motions"]["idle"], "中段与下段同为起伏"
+
+
+# --------------------------------------------------------------------------- #
+# petset（导出给桌面宠物插件的逐帧素材）
+# --------------------------------------------------------------------------- #
+
+def test_export_petset_writes_plugin_layout(make_character, make_config, write_config, tmp_path):
+    """导出的文件命名、清单与实际帧数必须自洽——插件侧靠这份清单驱动动画。"""
+    from flat2rig import petset
+
+    png = tmp_path / "hero.png"
+    make_character().save(png)
+    cfg_path = write_config("hero.rig.json", make_config())
+
+    export = petset.export_petset(
+        [{"name": "hero", "image": str(png), "config": str(cfg_path)}],
+        tmp_path / "petset-out", states=["idle", "sleep"],
+    )
+
+    manifest = export.to_manifest()
+    assert manifest["format"] == "flat2rig-petset/1"
+    assert set(manifest["characters"]) == {"hero"}
+    assert set(manifest["characters"]["hero"]) == {"idle", "sleep"}
+
+    on_disk = sorted(p.name for p in (tmp_path / "petset-out" / "frames").glob("*.png"))
+    assert export.frame_count == len(on_disk) > 0
+    for state, info in manifest["characters"]["hero"].items():
+        assert info["files"], f"{state} 没有帧"
+        for index, name in enumerate(info["files"], start=1):
+            # 插件约定：<角色>_<状态>_<两位序号>.png
+            assert name == f"hero_{state}_{index:02d}.png", name
+            assert name in on_disk
+        assert len(info["delays"]) == len(info["files"])
+        assert all(d > 0 for d in info["delays"])
+
+    # 回读清单应得到等价结构
+    back = petset.load_manifest(tmp_path / "petset-out" / "manifest.json")
+    assert back["hero"]["idle"]["files"] == manifest["characters"]["hero"]["idle"]["files"]
+
+
+def test_export_petset_reports_missing_art(tmp_path):
+    from flat2rig import petset
+
+    with pytest.raises(FileNotFoundError):
+        petset.export_petset([{"name": "nope", "image": str(tmp_path / "missing.png")}], tmp_path / "o")
+
+
+def test_copy_into_plugin_places_frames_and_manifest(make_character, make_config,
+                                                     write_config, tmp_path):
+    from flat2rig import petset
+
+    png = tmp_path / "hero.png"
+    make_character().save(png)
+    cfg_path = write_config("hero.rig.json", make_config())
+    out = tmp_path / "petset-out"
+    petset.export_petset([{"name": "hero", "image": str(png), "config": str(cfg_path)}], out,
+                         states=["idle"])
+
+    plugin = tmp_path / "plugin"
+    dst = petset.copy_into_plugin(out, plugin)
+    assert (dst / "manifest.json").is_file()
+    assert (dst / "frames").is_dir()
+    assert any((dst / "frames").glob("hero_idle_*.png"))
