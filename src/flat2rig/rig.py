@@ -100,6 +100,11 @@ class Part:
         z: paint order, higher = in front; also the tie-break priority for labeling.
         blend: half-width (px) of the soft transition band around this part's boundary.
         motions: ``state -> [[rotation_deg, dy_px], ...]``, one entry per frame.
+        shell: optional polygon ``[[x, y], ...]``.  Pixels inside it belong to this
+            part even when a neighbouring bone is closer.  Use it when the bones
+            cannot express the shape: a head bone is a thin vertical segment, so the
+            cheeks on either side are nearer to the ear bones and would be stolen by
+            the ear — which then drags them along on every rotation.
     """
 
     name: str
@@ -108,6 +113,7 @@ class Part:
     z: int = 0
     blend: float = DEFAULT_BLEND
     motions: dict[str, list[tuple[float, float]]] = field(default_factory=dict)
+    shell: list[tuple[float, float]] = field(default_factory=list)
 
 
 @dataclass
@@ -191,7 +197,8 @@ def load_rig(path: str | Path) -> Rig:
         z = int(round(_as_float(entry.get("z", 0), f"{where} z")))
         blend = max(_as_float(entry.get("blend", DEFAULT_BLEND), f"{where} blend"), 0.0)
         motions = _parse_motions(entry.get("motions"), where)
-        pending.append((name, bones, entry.get("region"), pivot, z, blend, motions))
+        shell = _parse_shell(entry.get("shell"), f"{where} shell")
+        pending.append((name, bones, entry.get("region"), pivot, z, blend, motions, shell))
 
     eyes = _parse_eyes(doc.get("eyes"), annotation_path)
     states = _parse_states(doc.get("states"), annotation_path)
@@ -204,7 +211,7 @@ def load_rig(path: str | Path) -> Rig:
     width, height = size
 
     parts: list[Part] = []
-    for name, bones, region, pivot, z, blend, motions in pending:
+    for name, bones, region, pivot, z, blend, motions, shell in pending:
         if not bones:
             bones = _bones_from_region(region, pivot, size)
         parts.append(
@@ -215,6 +222,7 @@ def load_rig(path: str | Path) -> Rig:
                 z=z,
                 blend=blend,
                 motions=motions,
+                shell=shell,
             )
         )
     return Rig(size=size, parts=parts, eyes=eyes, states=states, body=body)
@@ -427,6 +435,60 @@ class _Group:
     name: str
     bones: list[Bone]
     z: int
+    shells: list[list[tuple[float, float]]] = field(default_factory=list)
+
+
+def _parse_shell(value: Any, where: str) -> list[tuple[float, float]]:
+    """Parse an optional ``shell`` polygon: ``[[x, y], ...]`` with at least 3 points.
+
+    The polygon marks pixels that belong to this part **regardless of bone distance**.
+    It exists because bones cannot always express a shape: a head bone is one thin
+    vertical segment, so the cheeks on each side sit closer to the ear bones and get
+    labelled as ear — the ear then drags them along whenever it rotates.
+    """
+    if value is None:
+        return []
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"{where}: expected a list of [x, y] points")
+    points: list[tuple[float, float]] = []
+    for index, item in enumerate(value):
+        points.append(_as_pair(item, f"{where}[{index}]"))
+    if len(points) < 3:
+        raise ValueError(f"{where}: a polygon needs at least 3 points, got {len(points)}")
+    return points
+
+
+def _rasterize_polygon(points: Sequence[tuple[float, float]], width: int,
+                       height: int) -> np.ndarray:
+    """Rasterise a polygon (even-odd rule) into a bool array of shape ``(height, width)``."""
+    if len(points) < 3 or width <= 0 or height <= 0:
+        return np.zeros((max(height, 0), max(width, 0)), dtype=bool)
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    x0 = max(0, int(np.floor(min(xs))))
+    y0 = max(0, int(np.floor(min(ys))))
+    x1 = min(width, int(np.ceil(max(xs))) + 1)
+    y1 = min(height, int(np.ceil(max(ys))) + 1)
+    out = np.zeros((height, width), dtype=bool)
+    if x1 <= x0 or y1 <= y0:
+        return out
+    grid_y, grid_x = np.mgrid[y0:y1, x0:x1]
+    px = grid_x.astype(np.float64) + 0.5      # 像素中心
+    py = grid_y.astype(np.float64) + 0.5
+    inside = np.zeros(px.shape, dtype=bool)
+    count = len(points)
+    for i in range(count):
+        ax, ay = points[i]
+        bx, by = points[(i + 1) % count]
+        if ay == by:
+            continue
+        # 射线法：向下/向上穿越时翻转
+        crosses = ((ay > py) != (by > py))
+        with np.errstate(divide="ignore", invalid="ignore"):
+            x_cross = ax + (py - ay) * (bx - ax) / (by - ay)
+        inside ^= crosses & (px < x_cross)
+    out[y0:y1, x0:x1] = inside
+    return out
 
 
 def _part_groups(rig: Rig) -> list[_Group]:
@@ -436,12 +498,15 @@ def _part_groups(rig: Rig) -> list[_Group]:
     for part in rig.parts:
         group = seen.get(part.name)
         if group is None:
-            group = _Group(name=part.name, bones=list(part.bones), z=int(part.z))
+            group = _Group(name=part.name, bones=list(part.bones), z=int(part.z),
+                           shells=[list(part.shell)] if part.shell else [])
             seen[part.name] = group
             groups.append(group)
         else:
             group.bones.extend(part.bones)
             group.z = min(group.z, int(part.z))
+            if part.shell:
+                group.shells.append(list(part.shell))
     return groups
 
 
@@ -547,6 +612,15 @@ def assign_parts(rgba: Image.Image, rig: Rig) -> dict[str, Image.Image]:
     labels = _chamfer_keys(keys, len(groups) + 1)
     finite = labels < _FINITE_LIMIT
     decoded = np.where(finite, labels % (len(groups) + 1), -1)
+
+    # shell 覆盖：显式多边形优先于"最近骨骼"的推断。按 z 从后到前依次盖，
+    # 前面的部位后写、能压住后面的（与绘制顺序一致）。
+    for index in sorted(range(len(groups)), key=lambda i: (groups[i].z, i)):
+        for polygon in groups[index].shells:
+            inside = _rasterize_polygon(polygon, width, height) & alpha
+            if inside.any():
+                decoded[inside] = ranks[index]
+
     for index, group in enumerate(groups):
         selected = (decoded == ranks[index]) & alpha
         masks[group.name] = Image.fromarray(np.where(selected, np.uint8(255), np.uint8(0)))
@@ -612,6 +686,119 @@ def soften_masks(
     return {name: Image.fromarray(np.clip(out, 0.0, 255.0).astype(np.uint8)) for name, out in zip(names, outputs)}
 
 
+def refine_exposed_ownership(masks: dict[str, Image.Image], rig: Rig,
+                             steps: int = 6) -> dict[str, Image.Image]:
+    """Hand disputed pixels to the part that actually shows through when a neighbour moves.
+
+    The problem this solves (found by looking at rendered frames, not at code):
+
+    ``soften_masks`` deliberately feathered every boundary, so along the ear/head contact
+    each part owns a *fraction* of the pixels.  When the ear swings away, those fractional
+    pixels are all that is left there — the composite shows a pale, washed-out patch on the
+    cheek.  The patch is **not** missing fill, and it cannot be filled: the ear already owns
+    those pixels at full strength, so ``inpaint_hidden`` has nothing to add.
+
+    So instead of filling, decide who owns the contested strip.  A pixel is contested when
+    some *other* part sweeps over it (see ``swept_region``) — that other part is what the
+    viewer will see there once the move happens, so give it the pixel outright.  Runs
+    before feathering, so the result is still a clean partition of the alpha channel.
+
+    Only pixels that are *not* solidly owned by the moving part are reassigned: a pixel the
+    part covers with confidence stays with it (otherwise the part would develop holes where
+    it is genuinely opaque).
+    """
+    if not masks:
+        return masks
+    arrays = {name: np.array(np.asarray(image, dtype=np.uint8), copy=True)
+              for name, image in masks.items()}
+    height, width = next(iter(arrays.values())).shape
+    alpha_mask = np.zeros((height, width), dtype=bool)
+    for array in arrays.values():
+        alpha_mask |= array > 0
+
+    peaks = _motion_extent(rig)
+    pivots = {part.name: (float(part.pivot[0]), float(part.pivot[1])) for part in rig.parts}
+    owners = {name: array >= SOLID_OWNERSHIP for name, array in arrays.items()}
+    # 只交出"羽化带"上的像素：实权像素保持不动，否则分割会不守恒、部位还会被啃出洞。
+    boundary = {name: (array > 0) & ~owners[name] for name, array in arrays.items()}
+
+    # 从后到前处理：靠前的部位后写，与绘制顺序一致。
+    order = sorted(arrays, key=lambda n: next((p.z for p in rig.parts if p.name == n), 0))
+    for name in order:
+        peak = float(peaks.get(name, 0.0))
+        pivot = pivots.get(name)
+        if peak <= 1e-6 or pivot is None or not owners[name].any():
+            continue
+        swept = _swept_mask(owners[name], pivot, peak, steps) & ~owners[name]
+        for other, array_other in arrays.items():
+            if other == name:
+                continue
+            # 交接条件：该像素落在移动部位扫过的地方，且在原主人那里只是羽化边缘
+            take = swept & boundary[other]
+            if take.any():
+                arrays[other][take] = 255
+                arrays[name][take] = 0
+                owners[other][take] = True
+                owners[name][take] = False
+
+    return {name: Image.fromarray(array) for name, array in arrays.items()}
+
+
+#: Mask value at or above which a pixel counts as solidly owned (not a feather edge).
+SOLID_OWNERSHIP = 200
+
+
+def _motion_extent(rig: Rig) -> dict[str, float]:
+    """Largest rotation (deg) or translation (px) any part performs, per part."""
+    out: dict[str, float] = {}
+    for part in rig.parts:
+        peak = 0.0
+        for sequence in (part.motions or {}).values():
+            for move in sequence:
+                if not move:
+                    continue
+                peak = max(peak, abs(float(move[0])),
+                           max((abs(float(value)) for value in move[1:]), default=0.0))
+        out[part.name] = peak
+    return out
+
+
+def _swept_mask(mask: np.ndarray, pivot: tuple[float, float], peak: float,
+                steps: int = 6) -> np.ndarray:
+    """Union of ``mask`` over rotations/translations of up to ``peak`` (deg or px)."""
+    swept = mask.copy()
+    for index in range(1, max(1, steps) + 1):
+        offset = peak * index / steps
+        swept |= _rotate_mask_array(mask, pivot, offset)
+        swept |= _rotate_mask_array(mask, pivot, -offset)
+        swept |= _translate_mask_array(mask, 0, offset)
+        swept |= _translate_mask_array(mask, 0, -offset)
+    return swept
+
+
+def _rotate_mask_array(mask: np.ndarray, pivot: tuple[float, float], deg: float) -> np.ndarray:
+    """Rotate a bool mask around ``pivot`` by ``deg`` (nearest neighbour)."""
+    if abs(deg) < 1e-6:
+        return mask.copy()
+    image = Image.fromarray((mask.astype(np.uint8)) * 255, mode="L")
+    rotated = image.rotate(deg, resample=Image.NEAREST,
+                           center=(float(pivot[0]), float(pivot[1])), fillcolor=0)
+    return np.asarray(rotated, dtype=np.uint8) > 127
+
+
+def _translate_mask_array(mask: np.ndarray, dx: float, dy: float) -> np.ndarray:
+    """Translate a bool mask by whole pixels."""
+    ix, iy = int(round(dx)), int(round(dy))
+    if ix == 0 and iy == 0:
+        return mask
+    height, width = mask.shape
+    out = np.zeros_like(mask)
+    xs0, xs1 = (ix, width) if ix >= 0 else (0, width + ix)
+    ys0, ys1 = (iy, height) if iy >= 0 else (0, height + iy)
+    out[ys0 - iy:ys0 - iy + (ys1 - ys0), xs0 - ix:xs0 - ix + (xs1 - xs0)] = mask[ys0:ys1, xs0:xs1]
+    return out
+
+
 def build_masks(rgba: Image.Image, rig: Rig) -> dict[str, Image.Image]:
     """Full stage 1-2: nearest-bone labeling plus per-part boundary softening.
 
@@ -619,6 +806,8 @@ def build_masks(rgba: Image.Image, rig: Rig) -> dict[str, Image.Image]:
     character silhouette and, for a well-formed annotation, sum to the alpha there.
     """
     hard = assign_parts(rgba, rig)
+    # 掩膜归属精修：见 refine_exposed_ownership。必须在羽化之前做。
+    hard = refine_exposed_ownership(hard, rig)
     blends: dict[str, float] = {}
     for part in rig.parts:
         blends[part.name] = float(part.blend)

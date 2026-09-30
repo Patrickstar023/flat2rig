@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Iterable, Mapping, Sequence
 import numpy as np
 from PIL import Image, ImageDraw
 
-from .parts import cut_layers, inpaint_hidden, order_parts
+from .parts import cut_layers, inpaint_hidden, motion_extent, order_parts
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .rig import Rig
@@ -233,7 +233,9 @@ def build_frames(rgba: Image.Image, rig: "Rig", masks: dict[str, Image.Image],
     order = order_parts(rig)
     pivots = {p.name: (float(p.pivot[0]), float(p.pivot[1])) for p in parts}
     if layers is None:
-        layers = inpaint_hidden(rgba, masks, order)
+        # 补全范围要按每个部位实际的动作幅度来算（见 parts.motion_extent）
+        layers = inpaint_hidden(rgba, masks, order,
+                                angles=motion_extent(rig), pivots=pivots)
     size = rgba.size
     if seam is None:
         seam = _default_seam(parts)

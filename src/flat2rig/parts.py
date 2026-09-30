@@ -34,8 +34,10 @@ __all__ = ["cut_layers", "inpaint_hidden", "order_parts"]
 SUPPORT_THRESHOLD = 0.35
 #: Mask/alpha value above which a pixel counts as visible material.
 VISIBLE_EPS = 0.02
-#: Jacobi iterations for the diffusion fill (200 is plenty at 240 px).
+#: Jacobi iterations for the nearest-neighbour propagation (200 is plenty at 240 px).
 DIFFUSION_ITERS = 200
+#: Max per-channel difference for a mirror sample to be trusted (0-255).
+MIRROR_TOLERANCE = 26.0
 #: How many pixels of background colour get bled outwards (anti-halo margin).
 BLEED_ITERS = 4
 
@@ -81,35 +83,35 @@ def cut_layers(rgba: Image.Image, masks: dict[str, Image.Image]) -> dict[str, Im
     return layers
 
 
+def rotate_mask(mask: np.ndarray, pivot: tuple[float, float], deg: float) -> np.ndarray:
+    """把布尔掩膜绕 pivot 旋转 deg 度（最近邻），用于推算动作会露出哪块区域。"""
+    if abs(deg) < 1e-6:
+        return mask.copy()
+    img = Image.fromarray((mask.astype(np.uint8)) * 255, mode="L")
+    rotated = img.rotate(deg, resample=Image.NEAREST,
+                         center=(float(pivot[0]), float(pivot[1])), fillcolor=0)
+    return np.asarray(rotated, dtype=np.uint8) > 127
+
+
 def inpaint_hidden(rgba: Image.Image, masks: dict[str, Image.Image], order: list[str],
-                   radius: int = 6) -> dict[str, Image.Image]:
+                   radius: int = 6, angles: dict[str, float] | None = None,
+                   pivots: dict[str, tuple[float, float]] | None = None) -> dict[str, Image.Image]:
     """Return :func:`cut_layers` outputs extended by each part's hidden pixels.
 
     ``order`` is the paint order, back to front (see :func:`order_parts`).
-    For part ``P`` at index ``i`` the region it must additionally cover is the
-    union of the masks of every part painted *in front of* it (index ``> i``)
-    whose bounding box overlaps ``P``'s own bounding box.  That region is
-    intersected with a plausible silhouette for ``P`` -- its own pixels, its
-    mirror image across the character's vertical axis, and any concavity fully
-    enclosed by either -- so a part never grows a blob where it never existed
-    simply because a foreground part happened to overhang the outline.
 
-    The missing pixels are then reconstructed:
+    **需要补哪块**：不是"整块被遮挡区域"，也不是拍一个固定距离，而是
+    :func:`exposure_band` 算出的"会被别的部位移动掀开"的那块——只有这里会露成空洞。
+    传入 ``angles``（见 :func:`motion_extent`）与 ``pivots`` 启用该判据；不传时退回
+    "沿自身轮廓限距生长"的粗略做法（用在动画幅度未知的场合）。
 
-    1. mirror symmetry -- reflect across the vertical axis through the
-       character's alpha centroid and sample the part's own visible pixels;
-    2. iterative diffusion -- remaining pixels are filled with the
-       alpha-weighted average of their already-known 8/4-neighbours
-       (:data:`DIFFUSION_ITERS` Jacobi sweeps, bounded to the fill bounding box);
-    3. soft falloff -- the reconstruction is cross-faded over ``radius`` pixels
-       of the part's real pixels around the hole, and its alpha follows the mask
-       feather, so no seam appears when the front part moves away.
+    **怎么补**：先在与主体色的色差可接受时采信镜像样本，其余按"最近已知像素"传播色值。
+    这里刻意不用迭代扩散——扩散把周围颜色不断平均，补出来的块会明显发白。
 
-    ``radius`` is the width in pixels of that cross-fade band (and of the
-    dilation used around the hole); larger is smoother and slightly slower.
+    ``radius`` 是补全区向真实像素过渡的宽度（也用于孔洞外扩）；越大越柔和、稍慢。
 
-    Every name in ``masks`` gets an entry.  Names absent from ``order`` are
-    appended at the front (they cannot occlude anything the caller described).
+    ``masks`` 里每个名字都会出现在返回值中；``order`` 里没有的名字会被追加到最前
+    （它们遮挡不了调用者描述的那些部位）。
     """
     size = rgba.size
     height, width = size[1], size[0]
@@ -142,11 +144,21 @@ def inpaint_hidden(rgba: Image.Image, masks: dict[str, Image.Image], order: list
             continue
 
         support = _plausible_support(own_bin, mirror_src)
-        # 被遮挡区域按定义位于本部位"可见像素之外"，因此不能要求它落在自身轮廓内
-        # （否则补全会被全部否决）。合理判据：从可见像素出发，沿着被前景覆盖的区域
-        # 做连通生长——只补"前景确实压在上面、且与本体相连"的地方。
-        grown = _grow_into_front(own_bin, front, max_dist=max(8, int(radius) * 3))
-        occ = np.clip(front * np.maximum(support, grown) * (1.0 - own), 0.0, 1.0)
+        # 补全范围 = 会被其它部位的移动掀开、又没有别人接手的那块（见 exposure_band）。
+        # 没有动作信息时退回"沿自身轮廓限距生长"。
+        if angles and pivots:
+            peaks = {n: float(angles.get(n, 0.0)) for n in ordered}
+            band = exposure_band({n: soft[n] > SUPPORT_THRESHOLD for n in ordered},
+                                 ordered, name, peaks, pivots)
+            if not band.any():
+                out[name] = base[name]   # 这个部位不会被掀开，无需补
+                continue
+            # 用二值的"该像素是否属于本部位"而不是羽化权重：交界处的羽化值可能只有 0.1，
+            # 若按 (1-own) 折算，补全会被压到阈值以下而完全失效（真实踩过的坑）。
+            occ = np.clip((band & ~own_bin).astype(np.float32) + support * (1.0 - own), 0.0, 1.0)
+        else:
+            grown = _grow_from_own(own_bin, front, max_dist=max(8, int(radius) * 3))
+            occ = np.clip(front * np.maximum(support, grown) * (1.0 - own), 0.0, 1.0)
         occ_bin = occ > VISIBLE_EPS
         if not occ_bin.any():
             out[name] = base[name]
@@ -161,19 +173,91 @@ def inpaint_hidden(rgba: Image.Image, masks: dict[str, Image.Image], order: list
 # --------------------------------------------------------------------------- #
 # occlusion fill internals
 # --------------------------------------------------------------------------- #
-def _grow_into_front(own_bin: np.ndarray, front: np.ndarray,
-                     max_dist: int = 24, max_iter: int = 4096) -> np.ndarray:
-    """从本部位的可见像素出发，在"被前景覆盖"的区域里生长，但**限制在接触带内**。
+def motion_extent(rig) -> dict[str, float]:
+    """每个部位在所有状态里的最大"动作幅度"：旋转角度与平移像素取较大者。
 
-    两个关键约束（都是被真实缺陷逼出来的）：
+    只用旋转角度会漏掉"只平移不旋转"的部位（例如头随呼吸上下移动），
+    那样它的补全区会被算成空集 —— 真实缺陷：头被耳朵腾出来的那块就没人补。
+    """
+    out: dict[str, float] = {}
+    for part in getattr(rig, "parts", []):
+        peak = 0.0
+        for sequence in (part.motions or {}).values():
+            for move in sequence:
+                try:
+                    angle = abs(float(move[0]))
+                    shift = max((abs(float(v)) for v in move[1:]), default=0.0)
+                except (TypeError, ValueError, IndexError):
+                    continue
+                peak = max(peak, angle, shift)
+        out[part.name] = peak
+    return out
 
-    1. 不能要求补全区域"落在自身轮廓内"——被遮挡区域按定义就在轮廓之外；
-    2. 也不能把整块被遮挡区域都据为己有——那会把本部位的"空白填充版"整片盖到
-       前景之上（前景一旦不动，就会看到一块假的补丁）。
 
-    因此只补**离可见像素不超过 ``max_dist`` 像素、且被前景覆盖**的连通区域：
-    旋转只会在这个接触带里露出缝隙，补上这一条就够，其余保持透明，让下层的
-    真实像素透出来。
+def swept_region(mask: np.ndarray, pivot: tuple[float, float], peak: float,
+                 steps: int = 6) -> np.ndarray:
+    """该部位在 ±peak（角度或像素）内摆动时扫过的区域。
+
+    "需要补全的范围"不是拍脑袋的距离，而是这个扫掠区减去原始掩膜：
+    只有这块会因为动作而露出来。
+    """
+    swept = mask.copy()
+    for index in range(1, steps + 1):
+        offset = peak * index / steps
+        swept |= _shift_mask(rotate_mask(mask, pivot, offset), offset, 0)
+        swept |= _shift_mask(rotate_mask(mask, pivot, -offset), -offset, 0)
+    return swept
+
+
+def _shift_mask(mask: np.ndarray, dx: float, dy: float) -> np.ndarray:
+    """平移布尔掩膜（最近邻取整）。"""
+    ix, iy = int(round(dx)), int(round(dy))
+    if ix == 0 and iy == 0:
+        return mask
+    h, w = mask.shape
+    out = np.zeros_like(mask)
+    xs0, xs1 = (ix, w) if ix >= 0 else (0, w + ix)
+    xd0 = xs0 - ix
+    ys0, ys1 = (iy, h) if iy >= 0 else (0, h + iy)
+    yd0 = ys0 - iy
+    out[yd0:yd0 + (ys1 - ys0), xd0:xd0 + (xs1 - xs0)] = mask[ys0:ys1, xs0:xs1]
+    return out
+
+
+def exposure_band(masks: dict[str, np.ndarray], order: list[str],
+                  name: str, peaks: dict[str, float],
+                  pivots: dict[str, tuple[float, float]]) -> np.ndarray:
+    """``name`` 里"会被任意其它部位的移动掀开、因而必须补上"的区域。
+
+    推导：某像素现在被部位 Q 占着，但 Q 摆动后不再盖住它、又没有别人接手，
+    那么合成时这里就是透明的空洞。所以需要补的区域是
+
+        (Q 的扫掠区 - Q 现在的覆盖) ∩ name 的覆盖
+
+    对所有 Q 取并集。注意这里用的是**所有其它部位**的扫掠区，不是"paint 在前面的
+    那些" —— 耳朵往旁边转，被腾出来的是画在前面的**头**的地盘，只按 z 序取并集会漏掉。
+    """
+    mine = masks[name]
+    band = np.zeros_like(mine, dtype=bool)
+    for other, other_mask in masks.items():
+        if other == name:
+            continue
+        peak = float(peaks.get(other, 0.0))
+        if peak <= 1e-6:
+            continue
+        pivot = pivots.get(other)
+        if pivot is None:
+            continue
+        swept = swept_region(other_mask, pivot, peak)
+        band |= swept & ~other_mask & mine
+    return band
+
+
+def _grow_from_own(own_bin: np.ndarray, front: np.ndarray, max_dist: int = 24) -> np.ndarray:
+    """没有动作信息时的退路：从自身可见像素出发，沿前景区域限距生长。
+
+    只补"离本体不远、且被前景盖住"的连通区域，避免把整块被遮挡区域都占为己有
+    （那等于把本部位的空白填充版整片盖到前景之上，是真实出现过的缺陷）。
     """
     allowed = front > 0 if front.dtype != np.bool_ else front
     grown = np.zeros_like(own_bin, dtype=bool)
@@ -227,34 +311,60 @@ def _refill_layer(base: np.ndarray, src: np.ndarray, src_alpha: np.ndarray,
     val[seed] = rgb[sl][seed]
     wgt[seed] = np.maximum(src_alpha[sl][seed], 0.05)
 
-    # 3. mirror-symmetric guess, where the reflected pixel is part of this part.
+    # 3. 镜像对称只用于"小范围对齐校正"，不参与大面积取色。
+    #    真实缺陷：把镜像样本按全权重铺满被遮挡区，会把对侧（甚至眼睛）的颜色搬过来，
+    #    旋转后露出一块与周围不搭的色斑。因此这里只接受"距离很近且色差不大"的镜像样本，
+    #    其余一律交给第 4 步的最近邻传播（取本部位真实边界的颜色）。
     mirrored_own = own[:, mirror_src][sl]
-    mir = dom & (mirrored_own > VISIBLE_EPS)
+    mir = dom & (mirrored_own > VISIBLE_EPS) & (wgt <= 0.0)
     if mir.any():
-        val[mir] = rgb[:, mirror_src][sl][mir]
-        wgt[mir] = 1.0
+        mval = rgb[:, mirror_src][sl]
+        # 与已知种子的色差：超过阈值就不采信（避免把对侧的眼睛/深色轮廓搬过来）
+        if wgt.max() > 0.0:
+            known = wgt > 0.0
+            ref = val[known].mean(axis=0)
+            close = np.abs(mval - ref).max(axis=2) <= MIRROR_TOLERANCE
+            mir = mir & close
+        if mir.any():
+            val[mir] = mval[mir]
+            wgt[mir] = 1.0
 
-    # 4. diffusion for everything the mirror could not supply.
+    # 4. 剩余区域按"最近已知像素"传播色值。
+    #    这里用最近邻传播而不是迭代扩散：扩散把周围颜色不断平均，补出来的块会明显发白
+    #    （真实缺陷：旋转后露出的补丁比周围浅一大截）；最近邻传播取的是边界真实色值，
+    #    与邻域一致，看不出补丁。
     unknown = dom & (wgt <= 0.0)
-    for _ in range(DIFFUSION_ITERS):
-        if not unknown.any():
-            break
-        acc = np.zeros_like(val)
-        accw = np.zeros_like(wgt)
-        acc[1:, :] += val[:-1, :] * wgt[:-1, :, None]
-        accw[1:, :] += wgt[:-1, :]
-        acc[:-1, :] += val[1:, :] * wgt[1:, :, None]
-        accw[:-1, :] += wgt[1:, :]
-        acc[:, 1:] += val[:, :-1] * wgt[:, :-1, None]
-        accw[:, 1:] += wgt[:, :-1]
-        acc[:, :-1] += val[:, 1:] * wgt[:, 1:, None]
-        accw[:, :-1] += wgt[:, 1:]
-        upd = unknown & (accw > 0.0)
-        if not upd.any():
-            break  # hole is not connected to any known pixel
-        val[upd] = acc[upd] / accw[upd, None]
-        wgt[upd] = 1.0
-        unknown = unknown & ~upd
+    if unknown.any():
+        idx = np.full(unknown.shape, -1, dtype=np.intp)   # 该像素取色用的种子下标
+        known_flat = np.flatnonzero(wgt.ravel() > 0.0)
+        if known_flat.size:
+            idx.ravel()[known_flat] = known_flat
+            frontier = idx >= 0
+            for _ in range(DIFFUSION_ITERS):
+                if not (unknown & ~frontier).any():
+                    break
+                nxt = np.full(unknown.shape, -1, dtype=np.intp)
+                for src_slice, dst_slice in (
+                    ((slice(1, None), slice(None)), (slice(None, -1), slice(None))),
+                    ((slice(None, -1), slice(None)), (slice(1, None), slice(None))),
+                    ((slice(None), slice(1, None)), (slice(None), slice(None, -1))),
+                    ((slice(None), slice(None, -1)), (slice(None), slice(1, None))),
+                ):
+                    from_src = frontier[src_slice]
+                    take = from_src & (nxt[dst_slice] < 0)
+                    if take.any():
+                        nxt[dst_slice] = np.where(take, idx[src_slice], nxt[dst_slice])
+                fresh = (nxt >= 0) & ~frontier
+                if not fresh.any():
+                    break
+                idx[fresh] = nxt[fresh]
+                frontier = frontier | fresh
+            filled = unknown & (idx >= 0)
+            if filled.any():
+                flat_idx = np.clip(idx[filled], 0, val.reshape(-1, 3).shape[0] - 1)
+                val[filled] = val.reshape(-1, 3)[flat_idx]
+                wgt[filled] = 1.0
+            unknown = unknown & (idx < 0)
 
     # 5. falloff: full weight inside the hole, ramping to ~0 at the outer edge of
     #    the ring (geodesic distance measured from the hole itself).
