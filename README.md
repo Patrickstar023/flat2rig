@@ -1,4 +1,4 @@
-# flat2rig
+﻿# flat2rig
 
 **Turn a single flat character illustration into a rigged, part-animated sprite set — no GPU, no model weights, no manual layering.**
 
@@ -158,13 +158,13 @@ python examples/run_demo.py     # writes examples/out/, opens nothing
 | 切件（骨骼归属 + 羽化） | 0.01–0.02 s |
 | 遮挡补全 | 0.03–0.26 s |
 | 出帧（13 帧 × 4 状态） | 0.10 s |
-| 测试套件 | 35 项，0.8 s |
+| 测试套件 | 39 项，约 2 s |
 
 ## Tests
 
 ```bash
 pip install -e ".[dev]"
-pytest -q          # 35 passed
+pytest -q          # 39 passed
 ```
 
 ---

@@ -18,10 +18,49 @@ import sys
 from pathlib import Path
 
 STATES_DEFAULT = ["idle", "sleep", "error", "celebrate"]
+# 输出里的中文（提示、诊断、告警）需要 UTF-8 控制台。Windows 的默认代码页是 cp936/cp1252，
+# 直接 print 会抛 UnicodeEncodeError 把整个命令打挂（CI 的 Windows runner 就是这样挂的）。
+_ASCII_FALLBACK = {
+    "→": "->", "：": ": ", "，": ", ", "。": ".", "、": ", ",
+    "（": " (", "）": ") ", "「": '"', "」": '"', "—": "-",
+}
+
+
+def _force_utf8_streams() -> None:
+    """尽量把 stdout/stderr 切到 UTF-8；不支持时退回只打 ASCII。"""
+    import io
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name, None)
+        enc = (getattr(stream, "encoding", None) or "").lower().replace("-", "")
+        if not stream or enc in ("utf8", "utf8mb4", "cp65001"):
+            continue
+        try:  # 优先：重配置成 UTF-8（不换对象，重定向/管道也能用）
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):  # pragma: no cover - 平台差异
+            try:  # 退路：用替换错误处理器包一层
+                buffer = getattr(stream, "buffer", None)
+                if buffer is None:
+                    continue
+                setattr(sys, name, io.TextIOWrapper(buffer, encoding=enc or "ascii",
+                                                    errors="replace", line_buffering=True))
+            except (AttributeError, ValueError, OSError):
+                continue
+
+
+def _safe_print(*args, **kwargs) -> None:
+    """print 的兜底：即使流的编码无法表示这些字符，也不能让命令崩掉。"""
+    try:
+        print(*args, **kwargs)
+    except UnicodeEncodeError:
+        text = " ".join(str(a) for a in args)
+        for bad, good in _ASCII_FALLBACK.items():
+            text = text.replace(bad, good)
+        text = text.encode("ascii", "replace").decode("ascii")
+        print(text, **kwargs)
 
 
 def _fail(msg: str, code: int = 2) -> int:
-    print(f"flat2rig: {msg}", file=sys.stderr)
+    _safe_print(f"flat2rig: {msg}", file=sys.stderr)
     return code
 
 
@@ -84,7 +123,7 @@ def cmd_build(args: argparse.Namespace) -> int:
             name = f"{src.stem}_{state}_{i:02d}.png"
             img.save(frames_dir / name, "PNG", optimize=True)
             total += 1
-        print(f"  {state:10s} {len(seq):2d} 帧  每帧 {seq[0][1]} ms")
+        _safe_print(f"  {state:10s} {len(seq):2d} 帧  每帧 {seq[0][1]} ms")
 
     # 同时写一份机器可读的 rig.json，方便下游复用
     import json
@@ -100,10 +139,10 @@ def cmd_build(args: argparse.Namespace) -> int:
             "diagnostics": diag,
         }, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    print(f"\n共 {total} 帧 → {frames_dir}")
-    print(f"掩膜 → {masks_dir}")
+    _safe_print(f"\n共 {total} 帧 → {frames_dir}")
+    _safe_print(f"掩膜 → {masks_dir}")
     for w in diag.get("warnings", []):
-        print(f"  警告: {w}")
+        _safe_print(f"  警告: {w}")
     return 0
 
 
@@ -114,7 +153,7 @@ def cmd_preview(args: argparse.Namespace) -> int:
         return _fail(f"帧目录不存在：{frames_dir}")
     out = Path(args.output) if args.output else frames_dir.parent / "preview.html"
     write_preview(frames_dir, out)
-    print(f"预览页 → {out}（双击即可打开，素材已内联）")
+    _safe_print(f"预览页 → {out}（双击即可打开，素材已内联）")
     return 0
 
 
@@ -130,10 +169,10 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     diag = diagnose(rgba, rig, masks)
     out = Path(args.output)
     draw_diagnostic(rgba, rig, masks, out)
-    print(f"切件示意图 → {out}")
-    print(f"覆盖率 {diag['coverage']:.3f}；各部位像素：{diag['per_part_area']}")
+    _safe_print(f"切件示意图 → {out}")
+    _safe_print(f"覆盖率 {diag['coverage']:.3f}；各部位像素：{diag['per_part_area']}")
     for w in diag.get("warnings", []):
-        print(f"  警告: {w}")
+        _safe_print(f"  警告: {w}")
     return 0
 
 
@@ -179,9 +218,9 @@ def cmd_init(args: argparse.Namespace) -> int:
         return _fail(f"{out} 已存在；加 --force 覆盖")
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(TEMPLATE, encoding="utf-8")
-    print(f"已生成标注模板 → {out}")
-    print("用 inspect 核对切件，再改 motions 调动作：")
-    print(f"  flat2rig inspect <立绘.png> -c {out} -o debug.png")
+    _safe_print(f"已生成标注模板 → {out}")
+    _safe_print("用 inspect 核对切件，再改 motions 调动作：")
+    _safe_print(f"  flat2rig inspect <立绘.png> -c {out} -o debug.png")
     return 0
 
 
@@ -196,8 +235,8 @@ def cmd_autotag(args: argparse.Namespace) -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
     import json
     out.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"已生成初始标注 → {out}")
-    print(f"下一步： flat2rig inspect {src} -c {out} -o debug.png")
+    _safe_print(f"已生成初始标注 → {out}")
+    _safe_print(f"下一步： flat2rig inspect {src} -c {out} -o debug.png")
     return 0
 
 
@@ -227,16 +266,16 @@ def cmd_petset(args: argparse.Namespace) -> int:
 
     states = [s.strip() for s in args.states.split(",") if s.strip()] or None
     export = export_petset(entries, args.output, states=states)
-    print(f"导出 {len(export.characters)} 个角色、共 {export.frame_count} 帧 → {export.out_dir}")
+    _safe_print(f"导出 {len(export.characters)} 个角色、共 {export.frame_count} 帧 → {export.out_dir}")
     for who, states_map in export.characters.items():
         detail = "、".join(f"{st}×{len(info['files'])}" for st, info in states_map.items())
-        print(f"  {who:16s} {detail}")
-    print(f"  manifest → {Path(export.out_dir) / 'manifest.json'}")
+        _safe_print(f"  {who:16s} {detail}")
+    _safe_print(f"  manifest → {Path(export.out_dir) / 'manifest.json'}")
 
     if args.plugin:
         dst = copy_into_plugin(export.out_dir, args.plugin)
-        print(f"已复制到插件：{dst}")
-        print("下一步：在该插件仓库里执行  node build-frames.mjs --apply  让插件内联这些帧。")
+        _safe_print(f"已复制到插件：{dst}")
+        _safe_print("下一步：在该插件仓库里执行  node build-frames.mjs --apply  让插件内联这些帧。")
     return 0
 
 
@@ -291,6 +330,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _force_utf8_streams()
     args = build_parser().parse_args(argv)
     return args.func(args)
 

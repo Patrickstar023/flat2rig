@@ -1,4 +1,4 @@
-# Changelog
+﻿# Changelog
 
 本项目的变更记录，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
@@ -24,11 +24,15 @@
 - **桌面宠物交接（`petset.py`）**：导出 `<角色>_<状态>_<两位序号>.png` + `manifest.json`
   （帧文件与每帧毫秒数），可一键复制进宠物壳的素材目录。
 - **命令行（`cli.py`）**：`autotag` / `inspect` / `build` / `preview` / `init` / `petset`。
-- **测试**：38 项 pytest（掩膜分割不变量、遮挡补全、旋转几何、帧契约、图层栈匹配、
+- **测试**：39 项 pytest（掩膜分割不变量、遮挡补全、旋转几何、帧契约、图层栈匹配、
   标注容错、petset 布局与清单往返）。
 - **CI**：ubuntu + windows × Python 3.10/3.12，跑测试加一个合成角色的端到端冒烟脚本。
 
 ### Fixed
+
+- CLI 在非 UTF-8 控制台（Windows 默认代码页 cp936/cp1252）下打印中文提示会抛
+  `UnicodeEncodeError` 并以退出码 1 结束——CI 的 windows-latest 就是这么挂的。
+  现在启动时自动把 stdout/stderr 重配置为 UTF-8，并对 print 做 ASCII 兜底。
 
 - 遮挡补全原先要求补全区域"落在该部位自身轮廓内"，而被遮挡区域按定义在轮廓之外，
   导致补全被整条否决（功能形同不存在）。改为沿前景区域做**限距连通生长**。

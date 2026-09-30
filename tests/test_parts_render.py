@@ -408,6 +408,36 @@ def test_autotag_gives_different_motions_to_different_levels(make_character, tmp
 # petset（导出给桌面宠物插件的逐帧素材）
 # --------------------------------------------------------------------------- #
 
+def test_cli_survives_a_non_utf8_console(make_character, make_config, write_config, tmp_path):
+    """Windows 默认代码页（cp936/cp1252）下打中文不能崩。
+
+    这是 CI 在 windows-latest 上真实挂掉的原因：CLI 的提示语是中文，
+    而 runner 的 stdout 编码是 cp1252，print 抛 UnicodeEncodeError 让命令退出码变成 1。
+    """
+    import os
+    import subprocess
+    import sys
+
+    png = tmp_path / "hero.png"
+    make_character().save(png)
+    cfg_path = write_config("hero.rig.json", make_config())
+
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "cp1252"      # 模拟旧代码页控制台
+    env.pop("PYTHONUTF8", None)
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+
+    proc = subprocess.run(
+        [sys.executable, "-m", "flat2rig.cli", "inspect", str(png),
+         "-c", str(cfg_path), "-o", str(tmp_path / "debug.png")],
+        capture_output=True, env=env, cwd=tmp_path,
+    )
+    assert proc.returncode == 0, (
+        f"非 UTF-8 控制台下命令失败：\n{proc.stdout.decode('utf-8', 'replace')}\n"
+        f"{proc.stderr.decode('utf-8', 'replace')}")
+    assert (tmp_path / "debug.png").is_file()
+
+
 def test_export_petset_writes_plugin_layout(make_character, make_config, write_config, tmp_path):
     """导出的文件命名、清单与实际帧数必须自洽——插件侧靠这份清单驱动动画。"""
     from flat2rig import petset
