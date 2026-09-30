@@ -14,6 +14,8 @@ pip-*.log
 # 生成物
 out/
 examples/out/
+.ci-out/
+petset-out/
 frames/
 frames2/
 frames3/

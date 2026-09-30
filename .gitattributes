@@ -1,0 +1,16 @@
+# 统一换行，避免 Windows 提交把整仓改成 CRLF
+* text=auto eol=lf
+
+# 二进制素材：不做任何转换
+*.png binary
+*.webp binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.woff2 binary
+*.psd binary
+*.mjs text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.svg text eol=lf

@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.10", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Console script is installed
+        run: |
+          flat2rig --help
+          flat2rig autotag --help
+          flat2rig petset --help
+
+      - name: Tests
+        run: pytest -q
+
+      # End-to-end smoke test on a synthetic character: the repo deliberately ships no
+      # art (the demo illustrations are third-party), so CI has to draw its own.
+      - name: End-to-end on a synthetic character
+        run: python .github/smoke.py
+
+      - name: Upload smoke artefacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-${{ matrix.os }}-py${{ matrix.python }}
+          path: .ci-out/
+          if-no-files-found: warn
+          retention-days: 7
