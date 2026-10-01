@@ -114,6 +114,10 @@ class Part:
     blend: float = DEFAULT_BLEND
     motions: dict[str, list[tuple[float, float]]] = field(default_factory=dict)
     shell: list[tuple[float, float]] = field(default_factory=list)
+    #: 接缝内收（px）：把本部位的边界向外撑开这么多，使"接缝线"落在遮挡它的部件**下方**。
+    #: 用于"下方那层会露出来"的场景：耳朵转开后，只要头在接缝处是实心的，就不会透出背景。
+    #: 0 = 不内收（默认，行为与改动前一致）。
+    tuck: float = 0.0
 
 
 @dataclass
@@ -124,6 +128,8 @@ class Rig:
     parts: list[Part]
     eyes: list[tuple[float, float, float]] = field(default_factory=list)
     states: dict[str, int] = field(default_factory=dict)
+    #: 关节补丁半径（px）。None = 按各部位 blend 推导（见 render._default_seam）。
+    seam: int | None = None
     body: tuple[float, float] | None = None
 
     def part(self, name: str) -> Part | None:
@@ -196,9 +202,10 @@ def load_rig(path: str | Path) -> Rig:
             pivot = _as_pair(pivot_raw, f"{where} pivot")
         z = int(round(_as_float(entry.get("z", 0), f"{where} z")))
         blend = max(_as_float(entry.get("blend", DEFAULT_BLEND), f"{where} blend"), 0.0)
+        tuck = max(_as_float(entry.get("tuck", 0.0), f"{where} tuck"), 0.0)
         motions = _parse_motions(entry.get("motions"), where)
         shell = _parse_shell(entry.get("shell"), f"{where} shell")
-        pending.append((name, bones, entry.get("region"), pivot, z, blend, motions, shell))
+        pending.append((name, bones, entry.get("region"), pivot, z, blend, motions, shell, tuck))
 
     eyes = _parse_eyes(doc.get("eyes"), annotation_path)
     states = _parse_states(doc.get("states"), annotation_path)
@@ -211,7 +218,7 @@ def load_rig(path: str | Path) -> Rig:
     width, height = size
 
     parts: list[Part] = []
-    for name, bones, region, pivot, z, blend, motions, shell in pending:
+    for name, bones, region, pivot, z, blend, motions, shell, tuck in pending:
         if not bones:
             bones = _bones_from_region(region, pivot, size)
         parts.append(
@@ -223,9 +230,15 @@ def load_rig(path: str | Path) -> Rig:
                 blend=blend,
                 motions=motions,
                 shell=shell,
+                tuck=tuck,
             )
         )
-    return Rig(size=size, parts=parts, eyes=eyes, states=states, body=body)
+    # 关节补丁半径（可选）。旋转角大、或关节离枢轴远时，默认按 blend 推出的半径不够，
+    # 部件转开后会露出背景色的细缝（表现为"头和耳朵裂开"）。用 seam 显式给大一点。
+    seam_raw = doc.get("seam")
+    seam = None if seam_raw is None else max(
+        int(round(_as_float(seam_raw, f"{annotation_path}: seam"))), 0)
+    return Rig(size=size, parts=parts, eyes=eyes, states=states, body=body, seam=seam)
 
 
 def load_alpha(image_path: str | Path) -> tuple[Image.Image, Image.Image]:
@@ -628,7 +641,8 @@ def assign_parts(rgba: Image.Image, rig: Rig) -> dict[str, Image.Image]:
 
 
 def soften_masks(
-    masks: dict[str, Image.Image], blend: float | Mapping[str, float]
+    masks: dict[str, Image.Image], blend: float | Mapping[str, float],
+    tuck: float | Mapping[str, float] = 0.0,
 ) -> dict[str, Image.Image]:
     """Feather every mask boundary and renormalise the parts so their sum is preserved.
 
@@ -642,6 +656,12 @@ def soften_masks(
     Args:
         masks: ``{name: mask}``; single channel, 255 = belongs to the part.
         blend: transition half-width in pixels, or a ``{name: half-width}`` mapping.
+        tuck: how far (px) to grow a part's mask outward before feathering, or a
+            ``{name: amount}`` mapping.  This **moves the seam under the part in front**:
+            with a 10 px tuck the back part owns the whole transition band on its side of
+            the boundary, so it stays fully opaque underneath.  Without it, a moving part
+            that rotates away takes half the boundary pixels with it and the background
+            shows through the remaining half — which reads as "the head splits apart".
 
     Returns:
         New ``"L"`` masks with the same keys and order.
@@ -654,6 +674,9 @@ def soften_masks(
     for name, array in zip(names, arrays):
         if array.shape != shape:
             raise ValueError(f"mask '{name}' has shape {array.shape}, expected {shape}")
+
+    # 接缝内收：先把自己撑大，羽化后接缝线就落在前面那层的下方（见 docstring）。
+    arrays = [_grow(_tuck_for(name, tuck), array) for name, array in zip(names, arrays)]
 
     target = np.zeros(shape, dtype=np.float32)
     for array in arrays:
@@ -802,16 +825,19 @@ def _translate_mask_array(mask: np.ndarray, dx: float, dy: float) -> np.ndarray:
 def build_masks(rgba: Image.Image, rig: Rig) -> dict[str, Image.Image]:
     """Full stage 1-2: nearest-bone labeling plus per-part boundary softening.
 
-    Uses each :class:`Part`'s own ``blend`` width.  The returned masks are clipped to the
-    character silhouette and, for a well-formed annotation, sum to the alpha there.
+    Uses each :class:`Part`'s own ``blend`` width (and ``tuck`` inward amount).  The
+    returned masks are clipped to the character silhouette and, for a well-formed
+    annotation, sum to the alpha there.
     """
     hard = assign_parts(rgba, rig)
     # 掩膜归属精修：见 refine_exposed_ownership。必须在羽化之前做。
     hard = refine_exposed_ownership(hard, rig)
     blends: dict[str, float] = {}
+    tucks: dict[str, float] = {}
     for part in rig.parts:
         blends[part.name] = float(part.blend)
-    soft = soften_masks(hard, blends)
+        tucks[part.name] = float(part.tuck)
+    soft = soften_masks(hard, blends, tucks)
 
     rgba = rgba if rgba.mode == "RGBA" else rgba.convert("RGBA")
     alpha = np.asarray(rgba.getchannel("A"), dtype=np.uint8) > 0
@@ -947,6 +973,35 @@ def _blend_for(name: str, blend: float | Mapping[str, float]) -> float:
     if isinstance(blend, Mapping):
         return float(blend.get(name, DEFAULT_BLEND))
     return float(blend)
+
+
+def _tuck_for(name: str, tuck: float | Mapping[str, float]) -> float:
+    """Resolve the tuck amount for ``name`` (mapping form) or use the scalar."""
+    if isinstance(tuck, Mapping):
+        return float(tuck.get(name, 0.0))
+    return float(tuck)
+
+
+def _grow(amount: float, mask: np.ndarray) -> np.ndarray:
+    """Grow a mask outward by ``amount`` px with a linear falloff.
+
+    Implemented as a max over the 8 neighbouring shifts, weighted by distance, then a
+    small blur.  Cheap, dependency-free, and the linear falloff keeps the feathering
+    predictable (a hard dilation would create a second visible edge).
+    """
+    if amount <= 0.0:
+        return mask.astype(np.float32, copy=False)
+    radius = max(1, int(round(amount)))
+    grown = mask.astype(np.float32, copy=True)
+    for dy in range(-radius, radius + 1):
+        for dx in range(-radius, radius + 1):
+            dist = math.hypot(dx, dy)
+            if dist > radius or dist == 0:
+                continue
+            weight = 1.0 - dist / (radius + 1.0)
+            # np.roll 会在边界环绕，但乘以 <1 的权重后影响仅限图像边缘，可接受
+            grown = np.maximum(grown, np.roll(mask, (dy, dx), axis=(0, 1)) * weight)
+    return np.clip(grown, 0.0, 255.0)
 
 
 def _blur(values: np.ndarray, sigma: float) -> np.ndarray:

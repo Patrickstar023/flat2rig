@@ -35,6 +35,9 @@ __all__ = ["rotate_about", "compose_frame", "overlay_eyes", "overlay_symbol", "b
 
 #: Canvas the overlays are designed for; other sizes are scaled proportionally.
 CANVAS = 240
+#: 关节补丁半径上限。旧值是 ``CANVAS // 8``（=30）；抽成常量是为了让"为什么是这个数"
+#: 有地方可查，也方便 rig 用 ``seam`` 字段显式指定更大的补丁。
+MAX_SEAM = 40
 #: Colour of the source art's outline, reused by the eye / decoration overlays.
 INK = (30, 27, 46, 235)
 #: Sweat-drop fill.
@@ -238,7 +241,7 @@ def build_frames(rgba: Image.Image, rig: "Rig", masks: dict[str, Image.Image],
                                 angles=motion_extent(rig), pivots=pivots)
     size = rgba.size
     if seam is None:
-        seam = _default_seam(parts)
+        seam = _default_seam(parts, getattr(rig, "seam", None))
 
     frames: dict[str, list[tuple[Image.Image, int]]] = {}
     for state in _select_states(rig, states):
@@ -359,15 +362,24 @@ def _clipping_warning(name: str, state: str, index: int, layer: Image.Image,
             f"the part is clipped there -- add canvas margin or reduce the motion")
 
 
-def _default_seam(parts: Iterable[object]) -> int:
-    """Joint-patch radius derived from the parts' ``blend`` half-width."""
+def _default_seam(parts: Iterable[object], explicit: int | None = None) -> int:
+    """Joint-patch radius from the rig's ``seam`` field, else from ``blend``.
+
+    A rig can set ``"seam": N`` to name the radius directly.  That matters when a part
+    turns far: the wedge a rotation opens grows with the angle and with the distance
+    from the pivot to the joint boundary, so a 20 deg ear rotation needs a wider patch
+    than the 8-10 px that ``blend`` implies — otherwise a sliver of background opens
+    between the part and whatever sits behind it ("the head splits apart").
+    """
+    if explicit and explicit > 0:
+        return max(0, min(int(explicit), MAX_SEAM))
     blends = [float(getattr(part, "blend", 0.0) or 0.0) for part in parts]
     blends = [b for b in blends if b > 0.0]
     if not blends:
         return 0
     blends.sort()
     radius = int(round(blends[len(blends) // 2]))
-    return max(0, min(radius, CANVAS // 8))
+    return max(0, min(radius, MAX_SEAM))
 
 
 def _select_states(rig: "Rig", states: list[str] | None) -> list[str]:
