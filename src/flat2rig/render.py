@@ -212,7 +212,8 @@ def overlay_symbol(kind: str, step: int, size: int = CANVAS) -> Image.Image:
 def build_frames(rgba: Image.Image, rig: "Rig", masks: dict[str, Image.Image],
                  layers: dict[str, Image.Image] | None = None,
                  states: list[str] | None = None,
-                 seam: int | None = None) -> dict[str, list[tuple[Image.Image, int]]]:
+                 seam: int | None = None,
+                 repair_holes: bool = True) -> dict[str, list[tuple[Image.Image, int]]]:
     """Expand every state into ``[(frame, delay_ms), ...]``.
 
     ``layers`` defaults to :func:`flat2rig.parts.inpaint_hidden`, i.e. the
@@ -225,7 +226,9 @@ def build_frames(rgba: Image.Image, rig: "Rig", masks: dict[str, Image.Image],
     with a shorter list repeats its last entry.
 
     ``seam`` is the joint-patch radius forwarded to :func:`compose_frame`
-    (``None`` derives it from the parts' ``blend``).  Decorations are composited
+    (``None`` derives it from the parts' ``blend``).  ``repair_holes`` fills pixels that
+    compose as fully transparent although the base artwork has content there — the joint
+    gap a rotating part can leave behind.  Decorations are composited
     last, on top of everything: a blink frame is appended to ``idle`` when the
     rig has eyes, ``sleep`` gets closed eyes plus "zzz", ``error`` gets sweat and
     ``celebrate`` gets sparkles.  A part whose rotated bounds would leave the
@@ -273,6 +276,12 @@ def build_frames(rgba: Image.Image, rig: "Rig", masks: dict[str, Image.Image],
         sequence_frames: list[tuple[Image.Image, int]] = []
         for index, moves in enumerate(frame_moves):
             frame = compose_frame(layers, order, moves, pivots, seam=seam)
+            # 补缝：部件转开后，接缝处可能只剩下另一半的权重，背景就透了进来
+            # （表现为"头裂开"）。用底图把**完全透明**的像素补上——底图在那里本来
+            # 就有内容，补上是"把被遮挡的部分露出来"，而不是凭空造像素。
+            # 只补 alpha≈0 的像素，半透明的柔边不动，所以不会把画面糊掉。
+            if repair_holes:
+                frame = _fill_transparent(frame, rgba)
             overlay = _state_overlay(rig, state, index, size)
             if overlay is not None:
                 frame.alpha_composite(overlay)
@@ -290,6 +299,33 @@ def build_frames(rgba: Image.Image, rig: "Rig", masks: dict[str, Image.Image],
 # --------------------------------------------------------------------------- #
 # frame helpers
 # --------------------------------------------------------------------------- #
+def _fill_transparent(frame: Image.Image, base: Image.Image) -> Image.Image:
+    """Fill fully transparent pixels of ``frame`` from ``base``.
+
+    When a rigid part rotates away, the feathered boundary can leave the neighbour with
+    only part of the joint's pixels, so the background shows through along the joint ("the
+    head splits apart").  The base artwork has real content exactly there — it is what the
+    moving part was covering — so copying it in reveals hidden pixels rather than inventing
+    them.
+
+    Only ``alpha <= 2`` pixels are touched: the soft edges stay as they are, so the frame
+    keeps its antialiasing, and the repair cannot smear the drawing.  Pixels where ``base``
+    is also transparent are left alone (nothing to reveal).
+    """
+    out = frame if frame.mode == "RGBA" else frame.convert("RGBA")
+    src = base if base.mode == "RGBA" else base.convert("RGBA")
+    if out.size != src.size:
+        src = src.resize(out.size, Image.LANCZOS)
+    fa = np.asarray(out.getchannel("A"), dtype=np.uint8)
+    sa = np.asarray(src.getchannel("A"), dtype=np.uint8)
+    hole = (fa <= 2) & (sa > 0)
+    if not hole.any():
+        return out
+    fixed = out.copy()
+    fixed.paste(src, (0, 0), Image.fromarray(np.where(hole, 255, 0).astype(np.uint8)))
+    return fixed
+
+
 def _state_overlay(rig: "Rig", state: str, step: int, size: tuple[int, int]) -> Image.Image | None:
     """Decoration composited on top of every frame of ``state`` (or ``None``)."""
     symbol_size = max(size)
