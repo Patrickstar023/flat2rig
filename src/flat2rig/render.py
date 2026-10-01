@@ -99,7 +99,8 @@ def rotate_about(layer: Image.Image, pivot: tuple[float, float], deg: float,
 def compose_frame(layers: dict[str, Image.Image], order: list[str],
                   moves: dict[str, tuple[float, float, float]],
                   joints: dict[str, tuple[float, float]],
-                  seam: int = 0) -> Image.Image:
+                  seam: int = 0,
+                  base: Image.Image | None = None) -> Image.Image:
     """Paint ``order`` back to front, each layer transformed by ``moves``.
 
     ``moves[name]`` is ``(deg, dy, dx)``; missing names are drawn untransformed.
@@ -116,11 +117,44 @@ def compose_frame(layers: dict[str, Image.Image], order: list[str],
 
     Missing layers are skipped with a warning (a partially matched layer stack
     should still produce frames), which leaves the canvas transparent there.
+
+    ``base`` (optional) is the original artwork, composited **first — underneath every
+    part**.  It closes the joint gap a rotating part can leave behind: the base has real
+    content exactly there (it is what the part was covering), and because it sits
+    underneath, the moved part still covers it wherever the part now lies.  Painting the
+    same pixels *on top* instead would put the original outline next to the rotated one
+    and produce a visible double edge — which is what it looked like when the repair ran
+    after composition.
     """
     if not order:
         raise ValueError("order must contain at least one part name")
     size = _canvas_size(layers, order)
     canvas = Image.new("RGBA", size, (0, 0, 0, 0))
+
+    # 底图只补"部件没盖到"的位置（见 base 的说明）。
+    # 不能无条件垫底：部件自己也带 alpha，叠上去会让第 0 帧比原画更实
+    # （原画是柔边画风，重复叠加会改变观感）。
+    base_fill: Image.Image | None = None
+    if base is not None:
+        base_rgba = _fit(base if base.mode == "RGBA" else base.convert("RGBA"), size)
+        probe = Image.new("RGBA", size, (0, 0, 0, 0))
+        for name in order:
+            layer = layers.get(name)
+            if layer is None:
+                continue
+            deg, dy, dx = _triple(moves.get(name, (0.0, 0.0, 0.0)))
+            p = joints.get(name, (size[0] * 0.5, size[1] * 0.5))
+            probe.alpha_composite(rotate_about(_fit(layer, size), (float(p[0]), float(p[1])), deg, dy, dx))
+        pa = np.asarray(probe.getchannel("A"), dtype=np.uint8)
+        gap = np.where(pa <= 2, 255, 0).astype(np.uint8)
+        if gap.any():
+            base_fill = base_rgba.copy()
+            base_fill.putalpha(Image.fromarray(
+                (np.asarray(base_rgba.getchannel("A"), dtype=np.uint16)
+                 * np.asarray(Image.fromarray(gap), dtype=np.uint16) // 255).astype(np.uint8)))
+        # 垫在所有部件之下，只出现在"部件没盖到"的位置
+        if base_fill is not None:
+            canvas.alpha_composite(base_fill)
 
     for name in order:
         layer = layers.get(name)
